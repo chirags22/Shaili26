@@ -140,17 +140,28 @@ def _coach_type(value: object) -> str | None:
     return None
 
 
-def _coach_bucket(value: object) -> str | None:
-    if pd.isna(value):
+def _coach_bucket(coach_value: object, status_value: object = pd.NA) -> str | None:
+    coach_text = "" if pd.isna(coach_value) else str(coach_value).strip().upper()
+    status_text = "" if pd.isna(status_value) else str(status_value).strip().upper()
+    if not coach_text and not status_text:
         return None
-    text = str(value).strip().upper()
-    if not text or text == "NAN":
+    if coach_text == "NAN":
+        coach_text = ""
+    if status_text == "NAN":
+        status_text = ""
+    probe_text = f"{coach_text} {status_text}".strip()
+    if not probe_text:
         return None
-    has_wl = "WL" in text
-    base = _coach_type(text)
+    has_wl = "WL" in probe_text
+    has_rac = "RAC" in probe_text
+    base = _coach_type(coach_text if coach_text else probe_text)
     if base == "SL":
+        if has_rac:
+            return "SL-RAC"
         return "SL-WL" if has_wl else "SL"
     if base == "AC":
+        if has_rac:
+            return "AC-RAC"
         return "AC-WL" if has_wl else "AC"
     return None
 
@@ -272,6 +283,7 @@ def render_guest_page(df: pd.DataFrame) -> None:
     table_cols = [
         "Group",
         "Name",
+        "NAME ON TICKET-DEPARTURE",
         "Gender",
         "Age",
         "STAY",
@@ -283,6 +295,7 @@ def render_guest_page(df: pd.DataFrame) -> None:
         "Coach",
         "Seat",
         "Return",
+        "NAME ON TICKET-RETURN",
         "Status Return",
         "Return Station",
         "Return PNR",
@@ -310,6 +323,7 @@ def render_guest_page(df: pd.DataFrame) -> None:
     departure_cols = [
         "Group",
         "Name",
+        "NAME ON TICKET-DEPARTURE",
         "Gender",
         "Age",
         "STAY",
@@ -324,6 +338,7 @@ def render_guest_page(df: pd.DataFrame) -> None:
     return_cols = [
         "Group",
         "Name",
+        "NAME ON TICKET-RETURN",
         "Gender",
         "Age",
         "STAY",
@@ -430,33 +445,45 @@ def render_admin_page(df: pd.DataFrame) -> None:
         filtered_view = filtered
         st.markdown(f"**{result_title}**")
         if show_coach_counts:
+            coach_bucket_series = filtered.apply(
+                lambda row: _coach_bucket(row.get(coach_col), row.get(status_col)),
+                axis=1,
+            )
             coach_counts = (
-                filtered[coach_col]
-                .map(_coach_bucket)
+                coach_bucket_series
                 .dropna()
                 .value_counts()
-                .reindex(["SL", "SL-WL", "AC", "AC-WL"], fill_value=0)
+                .reindex(["SL", "SL-WL", "SL-RAC", "AC", "AC-WL", "AC-RAC"], fill_value=0)
             )
             selected_bucket_key = f"{key_prefix}_coach_bucket"
             if selected_bucket_key not in st.session_state:
                 st.session_state[selected_bucket_key] = "ALL"
 
-            bc0, bc1, bc2, bc3, bc4 = st.columns(5)
+            bc0, bc1, bc2, bc3, bc4, bc5, bc6 = st.columns(7)
             if bc0.button("All", key=f"{key_prefix}_bucket_all"):
                 st.session_state[selected_bucket_key] = "ALL"
             if bc1.button(f"SL ({int(coach_counts.get('SL', 0))})", key=f"{key_prefix}_bucket_sl"):
                 st.session_state[selected_bucket_key] = "SL"
             if bc2.button(f"SL-WL ({int(coach_counts.get('SL-WL', 0))})", key=f"{key_prefix}_bucket_sl_wl"):
                 st.session_state[selected_bucket_key] = "SL-WL"
-            if bc3.button(f"AC ({int(coach_counts.get('AC', 0))})", key=f"{key_prefix}_bucket_ac"):
+            if bc3.button(f"SL-RAC ({int(coach_counts.get('SL-RAC', 0))})", key=f"{key_prefix}_bucket_sl_rac"):
+                st.session_state[selected_bucket_key] = "SL-RAC"
+            if bc4.button(f"AC ({int(coach_counts.get('AC', 0))})", key=f"{key_prefix}_bucket_ac"):
                 st.session_state[selected_bucket_key] = "AC"
-            if bc4.button(f"AC-WL ({int(coach_counts.get('AC-WL', 0))})", key=f"{key_prefix}_bucket_ac_wl"):
+            if bc5.button(f"AC-WL ({int(coach_counts.get('AC-WL', 0))})", key=f"{key_prefix}_bucket_ac_wl"):
                 st.session_state[selected_bucket_key] = "AC-WL"
+            if bc6.button(f"AC-RAC ({int(coach_counts.get('AC-RAC', 0))})", key=f"{key_prefix}_bucket_ac_rac"):
+                st.session_state[selected_bucket_key] = "AC-RAC"
 
             selected_bucket = st.session_state[selected_bucket_key]
             st.caption(f"Selected coach filter: {selected_bucket}")
             if selected_bucket != "ALL":
-                filtered_view = filtered[filtered[coach_col].map(_coach_bucket) == selected_bucket].copy()
+                filtered_view = filtered[
+                    filtered.apply(
+                        lambda row: _coach_bucket(row.get(coach_col), row.get(status_col)) == selected_bucket,
+                        axis=1,
+                    )
+                ].copy()
 
         output_cols = [
             "Group",
@@ -472,6 +499,10 @@ def render_admin_page(df: pd.DataFrame) -> None:
             coach_col,
             seat_col,
         ]
+        if date_col == "Departure":
+            output_cols.insert(2, "NAME ON TICKET-DEPARTURE")
+        if date_col == "Return":
+            output_cols.insert(2, "NAME ON TICKET-RETURN")
         if include_bus_travel:
             output_cols.append("BUS TRAVEL")
         output_cols = [c for c in output_cols if c in filtered_view.columns]
@@ -665,7 +696,6 @@ def render_admin_page(df: pd.DataFrame) -> None:
 def main() -> None:
     st.title("Guest Travel Dashboard")
     st.caption("Find guests and view everyone sharing the same stay.")
-    st.caption(f"Using local file: `{DATA_FILE_DEFAULT}`")
 
     if not DATA_FILE_DEFAULT.exists():
         st.error("Boarding_Pass.xlsx not found in current folder.")
