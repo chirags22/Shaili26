@@ -120,6 +120,19 @@ def _safe_filename_part(value: str) -> str:
     return cleaned.lower() or "guest"
 
 
+def _jpeg_filename(*parts: object) -> str:
+    safe_parts: list[str] = []
+    for part in parts:
+        if part is None:
+            continue
+        text = str(part).strip()
+        if not text:
+            continue
+        safe_parts.append(_safe_filename_part(text))
+    base = "_".join(safe_parts) or "download"
+    return f"{base}.jpeg"
+
+
 def _coach_type(value: object) -> str | None:
     if pd.isna(value):
         return None
@@ -175,7 +188,9 @@ def _format_output_dates_and_age(df: pd.DataFrame) -> pd.DataFrame:
     out = out.rename(columns={"Departure": "Departure Date", "Return": "Return Date"})
     if "Age" in out.columns:
         out["Age"] = out["Age"].map(_clean_age_value)
-    return out
+    out = out.replace(r"^\s*$", pd.NA, regex=True)
+    out = out.replace({"nan": pd.NA, "NaN": pd.NA, "None": pd.NA, "<NA>": pd.NA})
+    return out.fillna("NA")
 
 
 @st.cache_data(show_spinner=False)
@@ -218,20 +233,10 @@ def load_data(file_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 def render_guest_page(df: pd.DataFrame) -> None:
     st.subheader("Filters")
-    st.caption("Search by Name, Group or Mobile Number")
-    f1, f2, f3 = st.columns(3)
+    st.caption("Search by Name")
+    f1 = st.columns(1)[0]
     name_options = sorted(
         [v for v in df["Name"].dropna().astype(str).str.strip().unique().tolist() if v and v.lower() != "nan"]
-    )
-    group_options = sorted(
-        [v for v in df["Group"].dropna().astype(str).str.strip().unique().tolist() if v and v.lower() != "nan"]
-    )
-    mobile_options = sorted(
-        [
-            v
-            for v in df["Mobile"].dropna().astype(str).str.strip().unique().tolist()
-            if v and v.lower() != "nan"
-        ]
     )
 
     with f1:
@@ -241,44 +246,20 @@ def render_guest_page(df: pd.DataFrame) -> None:
             index=None,
             placeholder="Type to search name",
         )
-    with f2:
-        group_query = st.selectbox(
-            "Group",
-            options=group_options,
-            index=None,
-            placeholder="Type to search group",
-        )
-    with f3:
-        mobile_query = st.selectbox(
-            "Mobile Number",
-            options=mobile_options,
-            index=None,
-            placeholder="Type to search mobile number",
-        )
-
     matched = df.copy()
-    if not any([name_query, group_query, mobile_query]):
-        st.info("Select at least one filter to search.")
+    if not name_query:
+        st.info("Select a name to search.")
         st.stop()
 
     if name_query:
         matched = matched[matched["Name"].astype(str).str.strip() == name_query]
-    if group_query:
-        matched = matched[matched["Group"].astype(str).str.strip() == group_query]
-    if mobile_query:
-        matched = matched[matched["Mobile"].astype(str).str.strip() == mobile_query]
-
     match_count = len(matched)
     st.caption(f"Matched People: {match_count}")
 
     if match_count == 0:
         st.warning("No match found for the selected filters.")
         st.stop()
-    group_only_mode = bool(group_query and not name_query and not mobile_query)
-    if group_only_mode:
-        base_token = group_query
-    else:
-        base_token = name_query if name_query else str(matched.iloc[0].get("Name", "guest"))
+    base_token = name_query if name_query else str(matched.iloc[0].get("Name", "guest"))
     base_filename = f"{_safe_filename_part(str(base_token))}_travel_data"
     table_cols = [
         "Group",
@@ -306,17 +287,18 @@ def render_guest_page(df: pd.DataFrame) -> None:
     ]
     table_cols = [c for c in table_cols if c in matched.columns]
 
-    if group_only_mode:
-        output_source = matched.sort_values(by=["Group", "Name"], na_position="last")
-        st.caption(f"Group selected: {group_query}")
-    else:
-        stay_values = [v for v in matched["STAY"].dropna().astype(str).str.strip().unique().tolist() if v]
-        if not stay_values:
-            st.info("Matched person has no STAY value, so no stay-group records can be shown.")
-            st.stop()
-        st.caption(f"Stay values found: {', '.join(stay_values)}")
-        output_source = df[df["STAY"].astype(str).str.strip().isin(stay_values)].copy()
-        output_source = output_source.sort_values(by=["STAY", "Group", "Name"], na_position="last")
+    stay_values = [v for v in matched["STAY"].dropna().astype(str).str.strip().unique().tolist() if v]
+    if not stay_values:
+        st.info("Matched person has no STAY value, so no stay-group records can be shown.")
+        st.stop()
+    st.caption(f"Stay values found: {', '.join(stay_values)}")
+    output_source = df[df["STAY"].astype(str).str.strip().isin(stay_values)].copy()
+    output_source["_searched_name_first"] = (
+        output_source["Name"].astype(str).str.strip() == str(name_query).strip()
+    )
+    output_source = output_source.sort_values(by=["STAY", "Group", "Name"], na_position="last")
+    output_source = output_source.sort_values(by="_searched_name_first", ascending=False, kind="stable")
+    output_source = output_source.drop(columns=["_searched_name_first"])
 
     output_df = _format_output_dates_and_age(output_source[table_cols].copy())
 
@@ -355,26 +337,23 @@ def render_guest_page(df: pd.DataFrame) -> None:
     return_cols = [c for c in return_cols if c in output_df.columns]
     departure_df = output_df[departure_cols].copy()
     return_df = output_df[return_cols].copy()
-    departure_df = _drop_empty_rows(
-        departure_df,
-        ["Departure Date", "Station Name", "PNR Number", "Train Number", "Coach", "Seat"],
-    )
-    return_df = _drop_empty_rows(
-        return_df,
-        ["Return Date", "Return Station", "Return PNR", "Return Train Number", "Return Coach", "Return Seat"],
-    )
 
     st.subheader("Travel Data")
 
     dep_header_col, dep_btn_col, _ = st.columns([2, 1, 6])
     with dep_header_col:
-        st.markdown("**Departure Table**")
+        st.markdown(
+            "<div style='display:inline-block;background:#ffec99;color:#1f2937;border:1px solid #d4a017;"
+            "padding:6px 10px;border-radius:6px;font-size:1.1rem;font-weight:700;'>"
+            "Departure Table (Towards Gujarat)</div>",
+            unsafe_allow_html=True,
+        )
     with dep_btn_col:
         dep_image_bytes = _table_image_bytes(departure_df, image_format="jpeg")
         st.download_button(
             "Download Departure (JPEG)",
             data=dep_image_bytes,
-            file_name=f"{base_filename}_departure.jpeg",
+            file_name=_jpeg_filename(base_filename, "departure", "towards_gujarat"),
             mime="image/jpeg",
         )
     st.dataframe(
@@ -386,13 +365,18 @@ def render_guest_page(df: pd.DataFrame) -> None:
 
     ret_header_col, ret_btn_col, _ = st.columns([2, 1, 6])
     with ret_header_col:
-        st.markdown("**Return Table**")
+        st.markdown(
+            "<div style='display:inline-block;background:#ffec99;color:#1f2937;border:1px solid #d4a017;"
+            "padding:6px 10px;border-radius:6px;font-size:1.1rem;font-weight:700;'>"
+            "Return Table (Towards Mumbai)</div>",
+            unsafe_allow_html=True,
+        )
     with ret_btn_col:
         ret_image_bytes = _table_image_bytes(return_df, image_format="jpeg")
         st.download_button(
             "Download Return (JPEG)",
             data=ret_image_bytes,
-            file_name=f"{base_filename}_return.jpeg",
+            file_name=_jpeg_filename(base_filename, "return", "towards_mumbai"),
             mime="image/jpeg",
         )
     st.dataframe(
@@ -440,6 +424,7 @@ def render_admin_page(df: pd.DataFrame) -> None:
         include_bus_travel: bool,
         show_coach_counts: bool = True,
         key_prefix: str = "admin",
+        download_name_parts: tuple[object, ...] | None = None,
     ) -> None:
         filtered = filtered.sort_values(by=["Group", "Name"], na_position="last")
         filtered_view = filtered
@@ -508,7 +493,23 @@ def render_admin_page(df: pd.DataFrame) -> None:
         output_cols = [c for c in output_cols if c in filtered_view.columns]
         output_df = _format_output_dates_and_age(filtered_view[output_cols].copy())
 
-        st.caption(f"Passengers found: {len(output_df)}")
+        header_col, dl_col, _ = st.columns([2, 1, 6])
+        with header_col:
+            st.caption(f"Passengers found: {len(output_df)}")
+        with dl_col:
+            admin_image_bytes = _table_image_bytes(output_df, image_format="jpeg")
+            file_name = (
+                _jpeg_filename(*download_name_parts)
+                if download_name_parts
+                else _jpeg_filename(result_title)
+            )
+            st.download_button(
+                "Download (JPEG)",
+                data=admin_image_bytes,
+                file_name=file_name,
+                mime="image/jpeg",
+                key=f"{key_prefix}_download_jpeg",
+            )
         st.dataframe(
             output_df,
             use_container_width=True,
@@ -577,6 +578,7 @@ def render_admin_page(df: pd.DataFrame) -> None:
             include_bus_travel=(j1 == "Return"),
             show_coach_counts=True,
             key_prefix="admin_dt",
+            download_name_parts=("admin", "date_train", j1, selected_date, selected_train),
         )
     else:
         st.info("Select journey type, date, and train number to view passengers.")
@@ -625,6 +627,8 @@ def render_admin_page(df: pd.DataFrame) -> None:
                 title,
                 include_bus_travel=False,
                 show_coach_counts=False,
+                key_prefix="admin_pnr_dep",
+                download_name_parts=("admin", "pnr", selected_pnr2, "departure"),
             )
 
         if has_ret:
@@ -643,6 +647,8 @@ def render_admin_page(df: pd.DataFrame) -> None:
                 "PNR Passenger List (Return)",
                 include_bus_travel=True,
                 show_coach_counts=False,
+                key_prefix="admin_pnr_ret",
+                download_name_parts=("admin", "pnr", selected_pnr2, "return"),
             )
 
         if not has_dep and not has_ret:
@@ -654,43 +660,99 @@ def render_admin_page(df: pd.DataFrame) -> None:
     st.subheader("3. Filter by Bus Date")
     if "BUS TRAVEL" not in df.columns:
         st.info("Bus travel column not available in data.")
-        return
+    else:
+        bus_rows = df[df["BUS TRAVEL"].astype(str).str.contains("BUS", case=False, na=False)].copy()
+        bus_rows = bus_rows[bus_rows["Return"].notna()].copy()
+        if bus_rows.empty:
+            st.info("No bus travel records with return date found.")
+        else:
+            bus_dates = sorted(bus_rows["Return"].dt.date.unique().tolist())
+            selected_bus_date = st.selectbox(
+                "Bus Travel Date (Return Date)",
+                options=bus_dates,
+                index=None,
+                placeholder="Select bus travel date",
+                format_func=lambda d: d.strftime("%d/%m/%Y"),
+                key="admin_bus_date_3",
+            )
+            if not selected_bus_date:
+                st.info("Select a bus travel date to view passengers.")
+            else:
+                bus_filtered = bus_rows[bus_rows["Return"].dt.date == selected_bus_date].copy()
+                date_col3, train_col3, status_col3, station_col3, pnr_col3, coach_col3, seat_col3, _ = journey_columns(
+                    "Return"
+                )
+                render_admin_result_block(
+                    bus_filtered,
+                    date_col3,
+                    train_col3,
+                    status_col3,
+                    station_col3,
+                    pnr_col3,
+                    coach_col3,
+                    seat_col3,
+                    "Bus Passenger List",
+                    include_bus_travel=True,
+                    show_coach_counts=False,
+                    key_prefix="admin_bus",
+                    download_name_parts=("admin", "bus", selected_bus_date, "return"),
+                )
 
-    bus_rows = df[df["BUS TRAVEL"].astype(str).str.contains("BUS", case=False, na=False)].copy()
-    bus_rows = bus_rows[bus_rows["Return"].notna()].copy()
-    if bus_rows.empty:
-        st.info("No bus travel records with return date found.")
-        return
-
-    bus_dates = sorted(bus_rows["Return"].dt.date.unique().tolist())
-    selected_bus_date = st.selectbox(
-        "Bus Travel Date (Return Date)",
-        options=bus_dates,
+    st.divider()
+    st.subheader("4. Filter by Group")
+    group_options4 = sorted(
+        [v for v in df["Group"].dropna().astype(str).str.strip().unique().tolist() if v and v.lower() != "nan"]
+    )
+    selected_group4 = st.selectbox(
+        "Group",
+        options=group_options4,
         index=None,
-        placeholder="Select bus travel date",
-        format_func=lambda d: d.strftime("%d/%m/%Y"),
-        key="admin_bus_date_3",
+        placeholder="Select group",
+        key="admin_group_4",
     )
-    if not selected_bus_date:
-        st.info("Select a bus travel date to view passengers.")
-        return
 
-    bus_filtered = bus_rows[bus_rows["Return"].dt.date == selected_bus_date].copy()
-    date_col3, train_col3, status_col3, station_col3, pnr_col3, coach_col3, seat_col3, _ = journey_columns("Return")
-    render_admin_result_block(
-        bus_filtered,
-        date_col3,
-        train_col3,
-        status_col3,
-        station_col3,
-        pnr_col3,
-        coach_col3,
-        seat_col3,
-        "Bus Passenger List",
-        include_bus_travel=True,
-        show_coach_counts=False,
-        key_prefix="admin_bus",
-    )
+    if selected_group4:
+        group_filtered = df[df["Group"].astype(str).str.strip() == selected_group4].copy()
+        dep_date_col, dep_train_col, dep_status_col, dep_station_col, dep_pnr_col, dep_coach_col, dep_seat_col, _ = (
+            journey_columns("Departure")
+        )
+        ret_date_col, ret_train_col, ret_status_col, ret_station_col, ret_pnr_col, ret_coach_col, ret_seat_col, _ = (
+            journey_columns("Return")
+        )
+
+        render_admin_result_block(
+            group_filtered,
+            dep_date_col,
+            dep_train_col,
+            dep_status_col,
+            dep_station_col,
+            dep_pnr_col,
+            dep_coach_col,
+            dep_seat_col,
+            "Group Passenger List (Departure)",
+            include_bus_travel=False,
+            show_coach_counts=False,
+            key_prefix="admin_group_dep",
+            download_name_parts=("admin", "group", selected_group4, "departure"),
+        )
+
+        render_admin_result_block(
+            group_filtered,
+            ret_date_col,
+            ret_train_col,
+            ret_status_col,
+            ret_station_col,
+            ret_pnr_col,
+            ret_coach_col,
+            ret_seat_col,
+            "Group Passenger List (Return)",
+            include_bus_travel=True,
+            show_coach_counts=False,
+            key_prefix="admin_group_ret",
+            download_name_parts=("admin", "group", selected_group4, "return"),
+        )
+    else:
+        st.info("Select a group to view passengers.")
 
 
 def main() -> None:
