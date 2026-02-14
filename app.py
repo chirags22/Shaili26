@@ -1,0 +1,694 @@
+from __future__ import annotations
+
+from io import BytesIO
+import os
+from pathlib import Path
+import re
+
+import matplotlib.pyplot as plt
+import pandas as pd
+import streamlit as st
+
+
+st.set_page_config(page_title="Boarding Pass Dashboard", layout="wide")
+
+
+DATA_FILE_DEFAULT = Path("Boarding_Pass.xlsx")
+
+
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    renamed = {
+        "Departure Date": "Departure",
+        "Return Date": "Return",
+        "Status \nReturn": "Status Return",
+        "To and From Station2": "Return Station",
+        "PNR Number2": "Return PNR",
+        "Return Train": "Return Train Number",
+        "Coach2": "Return Coach",
+        "Seat2": "Return Seat",
+    }
+    df = df.rename(columns=renamed)
+    return df
+
+
+def _to_datetime(series: pd.Series) -> pd.Series:
+    return pd.to_datetime(series, errors="coerce", dayfirst=True)
+
+
+def _clean_id_like_value(value: object) -> object:
+    if pd.isna(value):
+        return pd.NA
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return pd.NA
+    text = text.replace(",", "")
+    # Remove trailing ".0" only when it follows a digit token.
+    text = re.sub(r"(?<=\d)\.0(?=\D|$)", "", text)
+    return text
+
+
+def _table_image_bytes(df: pd.DataFrame, image_format: str = "png") -> bytes:
+    render_df = df.fillna("").astype(str)
+    n_rows, n_cols = render_df.shape
+    col_char_sizes = [max([len(str(c))] + render_df.iloc[:, i].map(len).tolist()) for i, c in enumerate(render_df.columns)]
+    total_chars = max(1, sum(col_char_sizes))
+    col_widths = [max(0.04, c / total_chars) for c in col_char_sizes]
+    width_scale = sum(col_char_sizes) * 0.16
+    fig_w = max(12, min(40, width_scale))
+    fig_h = max(3, min(40, (n_rows + 1) * 0.35))
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    ax.axis("off")
+
+    table = ax.table(
+        cellText=render_df.values,
+        colLabels=render_df.columns,
+        loc="center",
+        cellLoc="left",
+        colWidths=col_widths,
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1, 1.2)
+
+    buf = BytesIO()
+    save_format = "jpeg" if image_format.lower() in {"jpg", "jpeg"} else "png"
+    fig.savefig(buf, format=save_format, bbox_inches="tight", dpi=220)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _drop_empty_rows(df: pd.DataFrame, key_cols: list[str]) -> pd.DataFrame:
+    existing = [c for c in key_cols if c in df.columns]
+    if not existing:
+        return df
+    probe = df[existing].replace(r"^\s*$", pd.NA, regex=True)
+    return df[probe.notna().any(axis=1)].copy()
+
+
+def _table_height(row_count: int) -> int:
+    # Keep the table compact to avoid visual blank rows when result size is small.
+    return min(520, max(120, 38 + (row_count * 35)))
+
+
+def _has_text(value: object) -> bool:
+    if pd.isna(value):
+        return False
+    text = str(value).strip()
+    return bool(text and text.lower() != "nan")
+
+
+def _clean_age_value(value: object) -> object:
+    if pd.isna(value):
+        return pd.NA
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return pd.NA
+    try:
+        num = float(text)
+        if num.is_integer():
+            return str(int(num))
+        return str(num)
+    except ValueError:
+        return text
+
+
+def _safe_filename_part(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", value.strip())
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    return cleaned.lower() or "guest"
+
+
+def _coach_type(value: object) -> str | None:
+    if pd.isna(value):
+        return None
+    text = str(value).strip().upper()
+    if not text or text == "NAN":
+        return None
+    if "SL" in text:
+        return "SL"
+    if "AC" in text:
+        return "AC"
+    if "3E" in text:
+        return "AC"
+    first = text[0]
+    if first == "S":
+        return "SL"
+    if first in {"A", "B", "M"}:
+        return "AC"
+    return None
+
+
+def _coach_bucket(value: object) -> str | None:
+    if pd.isna(value):
+        return None
+    text = str(value).strip().upper()
+    if not text or text == "NAN":
+        return None
+    has_wl = "WL" in text
+    base = _coach_type(text)
+    if base == "SL":
+        return "SL-WL" if has_wl else "SL"
+    if base == "AC":
+        return "AC-WL" if has_wl else "AC"
+    return None
+
+
+def _format_output_dates_and_age(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "Departure" in out.columns:
+        out["Departure"] = pd.to_datetime(out["Departure"], errors="coerce").dt.strftime("%d/%m/%Y")
+    if "Return" in out.columns:
+        out["Return"] = pd.to_datetime(out["Return"], errors="coerce").dt.strftime("%d/%m/%Y")
+    out = out.rename(columns={"Departure": "Departure Date", "Return": "Return Date"})
+    if "Age" in out.columns:
+        out["Age"] = out["Age"].map(_clean_age_value)
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def load_data(file_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    master = pd.read_excel(file_path, sheet_name="MASTER")
+    extra_return = pd.read_excel(file_path, sheet_name="EXTRA RETURN TICKET")
+
+    master = _normalize_columns(master)
+    extra_return = _normalize_columns(extra_return)
+
+    for col in ["Departure", "Return"]:
+        if col in master.columns:
+            master[col] = _to_datetime(master[col])
+        if col in extra_return.columns:
+            extra_return[col] = _to_datetime(extra_return[col])
+
+    if "Gender" in master.columns:
+        master["Gender"] = master["Gender"].astype(str).str.upper().str.strip()
+
+    if "BUS TRAVEL" in master.columns:
+        master["Bus Required"] = master["BUS TRAVEL"].astype(str).str.contains(
+            "BUS", case=False, na=False
+        )
+    else:
+        master["Bus Required"] = False
+
+    for mobile_col in ["Mobile"]:
+        if mobile_col in master.columns:
+            master[mobile_col] = master[mobile_col].astype(str).str.replace(".0", "", regex=False)
+
+    id_like_cols = ["PNR Number", "Train Number", "Return PNR", "Return Train Number"]
+    for col in id_like_cols:
+        if col in master.columns:
+            master[col] = master[col].map(_clean_id_like_value)
+        if col in extra_return.columns:
+            extra_return[col] = extra_return[col].map(_clean_id_like_value)
+
+    return master, extra_return
+
+
+def render_guest_page(df: pd.DataFrame) -> None:
+    st.subheader("Filters")
+    st.caption("Search by Name, Group or Mobile Number")
+    f1, f2, f3 = st.columns(3)
+    name_options = sorted(
+        [v for v in df["Name"].dropna().astype(str).str.strip().unique().tolist() if v and v.lower() != "nan"]
+    )
+    group_options = sorted(
+        [v for v in df["Group"].dropna().astype(str).str.strip().unique().tolist() if v and v.lower() != "nan"]
+    )
+    mobile_options = sorted(
+        [
+            v
+            for v in df["Mobile"].dropna().astype(str).str.strip().unique().tolist()
+            if v and v.lower() != "nan"
+        ]
+    )
+
+    with f1:
+        name_query = st.selectbox(
+            "Name",
+            options=name_options,
+            index=None,
+            placeholder="Type to search name",
+        )
+    with f2:
+        group_query = st.selectbox(
+            "Group",
+            options=group_options,
+            index=None,
+            placeholder="Type to search group",
+        )
+    with f3:
+        mobile_query = st.selectbox(
+            "Mobile Number",
+            options=mobile_options,
+            index=None,
+            placeholder="Type to search mobile number",
+        )
+
+    matched = df.copy()
+    if not any([name_query, group_query, mobile_query]):
+        st.info("Select at least one filter to search.")
+        st.stop()
+
+    if name_query:
+        matched = matched[matched["Name"].astype(str).str.strip() == name_query]
+    if group_query:
+        matched = matched[matched["Group"].astype(str).str.strip() == group_query]
+    if mobile_query:
+        matched = matched[matched["Mobile"].astype(str).str.strip() == mobile_query]
+
+    match_count = len(matched)
+    st.caption(f"Matched People: {match_count}")
+
+    if match_count == 0:
+        st.warning("No match found for the selected filters.")
+        st.stop()
+    group_only_mode = bool(group_query and not name_query and not mobile_query)
+    if group_only_mode:
+        base_token = group_query
+    else:
+        base_token = name_query if name_query else str(matched.iloc[0].get("Name", "guest"))
+    base_filename = f"{_safe_filename_part(str(base_token))}_travel_data"
+    table_cols = [
+        "Group",
+        "Name",
+        "Gender",
+        "Age",
+        "STAY",
+        "Departure",
+        "Status Departure",
+        "Station Name",
+        "PNR Number",
+        "Train Number",
+        "Coach",
+        "Seat",
+        "Return",
+        "Status Return",
+        "Return Station",
+        "Return PNR",
+        "Return Train Number",
+        "Return Coach",
+        "Return Seat",
+        "BUS TRAVEL",
+    ]
+    table_cols = [c for c in table_cols if c in matched.columns]
+
+    if group_only_mode:
+        output_source = matched.sort_values(by=["Group", "Name"], na_position="last")
+        st.caption(f"Group selected: {group_query}")
+    else:
+        stay_values = [v for v in matched["STAY"].dropna().astype(str).str.strip().unique().tolist() if v]
+        if not stay_values:
+            st.info("Matched person has no STAY value, so no stay-group records can be shown.")
+            st.stop()
+        st.caption(f"Stay values found: {', '.join(stay_values)}")
+        output_source = df[df["STAY"].astype(str).str.strip().isin(stay_values)].copy()
+        output_source = output_source.sort_values(by=["STAY", "Group", "Name"], na_position="last")
+
+    output_df = _format_output_dates_and_age(output_source[table_cols].copy())
+
+    departure_cols = [
+        "Group",
+        "Name",
+        "Gender",
+        "Age",
+        "STAY",
+        "Departure Date",
+        "Status Departure",
+        "Station Name",
+        "PNR Number",
+        "Train Number",
+        "Coach",
+        "Seat",
+    ]
+    return_cols = [
+        "Group",
+        "Name",
+        "Gender",
+        "Age",
+        "STAY",
+        "Return Date",
+        "Status Return",
+        "Return Station",
+        "Return PNR",
+        "Return Train Number",
+        "Return Coach",
+        "Return Seat",
+        "BUS TRAVEL",
+    ]
+    departure_cols = [c for c in departure_cols if c in output_df.columns]
+    return_cols = [c for c in return_cols if c in output_df.columns]
+    departure_df = output_df[departure_cols].copy()
+    return_df = output_df[return_cols].copy()
+    departure_df = _drop_empty_rows(
+        departure_df,
+        ["Departure Date", "Station Name", "PNR Number", "Train Number", "Coach", "Seat"],
+    )
+    return_df = _drop_empty_rows(
+        return_df,
+        ["Return Date", "Return Station", "Return PNR", "Return Train Number", "Return Coach", "Return Seat"],
+    )
+
+    st.subheader("Travel Data")
+
+    dep_header_col, dep_btn_col, _ = st.columns([2, 1, 6])
+    with dep_header_col:
+        st.markdown("**Departure Table**")
+    with dep_btn_col:
+        dep_image_bytes = _table_image_bytes(departure_df, image_format="jpeg")
+        st.download_button(
+            "Download Departure (JPEG)",
+            data=dep_image_bytes,
+            file_name=f"{base_filename}_departure.jpeg",
+            mime="image/jpeg",
+        )
+    st.dataframe(
+        departure_df,
+        use_container_width=True,
+        hide_index=True,
+        height=_table_height(len(departure_df)),
+    )
+
+    ret_header_col, ret_btn_col, _ = st.columns([2, 1, 6])
+    with ret_header_col:
+        st.markdown("**Return Table**")
+    with ret_btn_col:
+        ret_image_bytes = _table_image_bytes(return_df, image_format="jpeg")
+        st.download_button(
+            "Download Return (JPEG)",
+            data=ret_image_bytes,
+            file_name=f"{base_filename}_return.jpeg",
+            mime="image/jpeg",
+        )
+    st.dataframe(
+        return_df,
+        use_container_width=True,
+        hide_index=True,
+        height=_table_height(len(return_df)),
+    )
+
+
+def render_admin_page(df: pd.DataFrame) -> None:
+    def journey_columns(journey_type: str) -> tuple[str, str, str, str, str, str, str, str]:
+        if journey_type == "Departure":
+            return (
+                "Departure",
+                "Train Number",
+                "Status Departure",
+                "Station Name",
+                "PNR Number",
+                "Coach",
+                "Seat",
+                "Departure Date",
+            )
+        return (
+            "Return",
+            "Return Train Number",
+            "Status Return",
+            "Return Station",
+            "Return PNR",
+            "Return Coach",
+            "Return Seat",
+            "Return Date",
+        )
+
+    def render_admin_result_block(
+        filtered: pd.DataFrame,
+        date_col: str,
+        train_col: str,
+        status_col: str,
+        station_col: str,
+        pnr_col: str,
+        coach_col: str,
+        seat_col: str,
+        result_title: str,
+        include_bus_travel: bool,
+        show_coach_counts: bool = True,
+        key_prefix: str = "admin",
+    ) -> None:
+        filtered = filtered.sort_values(by=["Group", "Name"], na_position="last")
+        filtered_view = filtered
+        st.markdown(f"**{result_title}**")
+        if show_coach_counts:
+            coach_counts = (
+                filtered[coach_col]
+                .map(_coach_bucket)
+                .dropna()
+                .value_counts()
+                .reindex(["SL", "SL-WL", "AC", "AC-WL"], fill_value=0)
+            )
+            selected_bucket_key = f"{key_prefix}_coach_bucket"
+            if selected_bucket_key not in st.session_state:
+                st.session_state[selected_bucket_key] = "ALL"
+
+            bc0, bc1, bc2, bc3, bc4 = st.columns(5)
+            if bc0.button("All", key=f"{key_prefix}_bucket_all"):
+                st.session_state[selected_bucket_key] = "ALL"
+            if bc1.button(f"SL ({int(coach_counts.get('SL', 0))})", key=f"{key_prefix}_bucket_sl"):
+                st.session_state[selected_bucket_key] = "SL"
+            if bc2.button(f"SL-WL ({int(coach_counts.get('SL-WL', 0))})", key=f"{key_prefix}_bucket_sl_wl"):
+                st.session_state[selected_bucket_key] = "SL-WL"
+            if bc3.button(f"AC ({int(coach_counts.get('AC', 0))})", key=f"{key_prefix}_bucket_ac"):
+                st.session_state[selected_bucket_key] = "AC"
+            if bc4.button(f"AC-WL ({int(coach_counts.get('AC-WL', 0))})", key=f"{key_prefix}_bucket_ac_wl"):
+                st.session_state[selected_bucket_key] = "AC-WL"
+
+            selected_bucket = st.session_state[selected_bucket_key]
+            st.caption(f"Selected coach filter: {selected_bucket}")
+            if selected_bucket != "ALL":
+                filtered_view = filtered[filtered[coach_col].map(_coach_bucket) == selected_bucket].copy()
+
+        output_cols = [
+            "Group",
+            "Name",
+            "Gender",
+            "Age",
+            "STAY",
+            date_col,
+            status_col,
+            station_col,
+            pnr_col,
+            train_col,
+            coach_col,
+            seat_col,
+        ]
+        if include_bus_travel:
+            output_cols.append("BUS TRAVEL")
+        output_cols = [c for c in output_cols if c in filtered_view.columns]
+        output_df = _format_output_dates_and_age(filtered_view[output_cols].copy())
+
+        st.caption(f"Passengers found: {len(output_df)}")
+        st.dataframe(
+            output_df,
+            use_container_width=True,
+            hide_index=True,
+            height=_table_height(len(output_df)),
+        )
+
+    st.subheader("1. Filter by Date and Train")
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        j1 = st.selectbox("Journey Type", options=["Departure", "Return"], index=0, key="admin_journey_1")
+    date_col, train_col, status_col, station_col, pnr_col, coach_col, seat_col, date_label = journey_columns(j1)
+
+    valid_journey_rows = df[
+        df[train_col].map(_has_text)
+        | df[pnr_col].map(_has_text)
+        | df[coach_col].map(_has_text)
+        | df[seat_col].map(_has_text)
+    ].copy()
+    date_values = sorted(valid_journey_rows[date_col].dropna().dt.date.unique().tolist())
+    with d2:
+        selected_date = st.selectbox(
+            "Date",
+            options=date_values,
+            index=None,
+            placeholder=f"Select {date_label.lower()}",
+            format_func=lambda d: d.strftime("%d/%m/%Y"),
+            key="admin_date_1",
+        )
+
+    selected_train = None
+    if selected_date:
+        date_filtered = valid_journey_rows[valid_journey_rows[date_col].dt.date == selected_date].copy()
+        train_options = sorted(
+            [
+                v
+                for v in date_filtered[train_col].dropna().astype(str).str.strip().unique().tolist()
+                if v and v.lower() != "nan"
+            ]
+        )
+    else:
+        date_filtered = pd.DataFrame(columns=df.columns)
+        train_options = []
+
+    with d3:
+        selected_train = st.selectbox(
+            "Train Number",
+            options=train_options,
+            index=None,
+            placeholder="Select train number",
+            key="admin_train_1",
+        )
+
+    if selected_date and selected_train:
+        filtered_dt = date_filtered[date_filtered[train_col].astype(str).str.strip() == selected_train].copy()
+        render_admin_result_block(
+            filtered_dt,
+            date_col,
+            train_col,
+            status_col,
+            station_col,
+            pnr_col,
+            coach_col,
+            seat_col,
+            "Train Passenger List",
+            include_bus_travel=(j1 == "Return"),
+            show_coach_counts=True,
+            key_prefix="admin_dt",
+        )
+    else:
+        st.info("Select journey type, date, and train number to view passengers.")
+
+    st.divider()
+    st.subheader("2. Filter by PNR")
+    dep_pnr_options = [
+        v for v in df["PNR Number"].dropna().astype(str).str.strip().unique().tolist() if v and v.lower() != "nan"
+    ]
+    ret_pnr_options = [
+        v
+        for v in df["Return PNR"].dropna().astype(str).str.strip().unique().tolist()
+        if v and v.lower() != "nan"
+    ]
+    pnr_options2 = sorted(set(dep_pnr_options) | set(ret_pnr_options))
+    selected_pnr2 = st.selectbox(
+        "PNR",
+        options=pnr_options2,
+        index=None,
+        placeholder="Select PNR number",
+        key="admin_pnr_2",
+    )
+
+    if selected_pnr2:
+        dep_filtered = df[df["PNR Number"].astype(str).str.strip() == selected_pnr2].copy()
+        ret_filtered = df[df["Return PNR"].astype(str).str.strip() == selected_pnr2].copy()
+        has_dep = not dep_filtered.empty
+        has_ret = not ret_filtered.empty
+
+        if has_dep:
+            date_col2, train_col2, status_col2, station_col2, pnr_col2, coach_col2, seat_col2, _ = journey_columns(
+                "Departure"
+            )
+            title = "PNR Passenger List (Departure)"
+            if has_ret:
+                st.caption("PNR found in both departure and return data.")
+            render_admin_result_block(
+                dep_filtered,
+                date_col2,
+                train_col2,
+                status_col2,
+                station_col2,
+                pnr_col2,
+                coach_col2,
+                seat_col2,
+                title,
+                include_bus_travel=False,
+                show_coach_counts=False,
+            )
+
+        if has_ret:
+            date_col2, train_col2, status_col2, station_col2, pnr_col2, coach_col2, seat_col2, _ = journey_columns(
+                "Return"
+            )
+            render_admin_result_block(
+                ret_filtered,
+                date_col2,
+                train_col2,
+                status_col2,
+                station_col2,
+                pnr_col2,
+                coach_col2,
+                seat_col2,
+                "PNR Passenger List (Return)",
+                include_bus_travel=True,
+                show_coach_counts=False,
+            )
+
+        if not has_dep and not has_ret:
+            st.warning("PNR not found in departure or return data.")
+    else:
+        st.info("Select a PNR to view passengers.")
+
+    st.divider()
+    st.subheader("3. Filter by Bus Date")
+    if "BUS TRAVEL" not in df.columns:
+        st.info("Bus travel column not available in data.")
+        return
+
+    bus_rows = df[df["BUS TRAVEL"].astype(str).str.contains("BUS", case=False, na=False)].copy()
+    bus_rows = bus_rows[bus_rows["Return"].notna()].copy()
+    if bus_rows.empty:
+        st.info("No bus travel records with return date found.")
+        return
+
+    bus_dates = sorted(bus_rows["Return"].dt.date.unique().tolist())
+    selected_bus_date = st.selectbox(
+        "Bus Travel Date (Return Date)",
+        options=bus_dates,
+        index=None,
+        placeholder="Select bus travel date",
+        format_func=lambda d: d.strftime("%d/%m/%Y"),
+        key="admin_bus_date_3",
+    )
+    if not selected_bus_date:
+        st.info("Select a bus travel date to view passengers.")
+        return
+
+    bus_filtered = bus_rows[bus_rows["Return"].dt.date == selected_bus_date].copy()
+    date_col3, train_col3, status_col3, station_col3, pnr_col3, coach_col3, seat_col3, _ = journey_columns("Return")
+    render_admin_result_block(
+        bus_filtered,
+        date_col3,
+        train_col3,
+        status_col3,
+        station_col3,
+        pnr_col3,
+        coach_col3,
+        seat_col3,
+        "Bus Passenger List",
+        include_bus_travel=True,
+        show_coach_counts=False,
+        key_prefix="admin_bus",
+    )
+
+
+def main() -> None:
+    st.title("Guest Travel Dashboard")
+    st.caption("Find guests and view everyone sharing the same stay.")
+    st.caption(f"Using local file: `{DATA_FILE_DEFAULT}`")
+
+    if not DATA_FILE_DEFAULT.exists():
+        st.error("Boarding_Pass.xlsx not found in current folder.")
+        st.stop()
+
+    try:
+        df, _ = load_data(str(DATA_FILE_DEFAULT))
+    except Exception as exc:
+        st.exception(exc)
+        st.stop()
+
+    page = st.radio("Page", options=["Guest", "Admin"], horizontal=True)
+    if page == "Guest":
+        render_guest_page(df)
+        return
+
+    admin_passcode = st.text_input("Admin Access Code", type="password")
+    expected_passcode = os.environ.get("ADMIN_DASHBOARD_PASSCODE", "Shaili*26")
+    if admin_passcode != expected_passcode:
+        st.warning("Admin access required.")
+        st.stop()
+    render_admin_page(df)
+
+
+if __name__ == "__main__":
+    main()
