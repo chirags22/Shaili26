@@ -756,7 +756,7 @@ def render_admin_page(df: pd.DataFrame) -> None:
 
 
 def main() -> None:
-    st.title("Guest Travel Dashboard")
+    st.title("Shailiben Diksha Mahotsav Guest Travel Dashboard")
     st.caption("Find guests and view everyone sharing the same stay.")
 
     if not DATA_FILE_DEFAULT.exists():
