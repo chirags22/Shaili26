@@ -193,6 +193,24 @@ def _format_output_dates_and_age(df: pd.DataFrame) -> pd.DataFrame:
     return out.fillna("NA")
 
 
+def _to_phone_href(value: object) -> str | None:
+    if pd.isna(value):
+        return None
+    raw = str(value).strip()
+    if not raw or raw.lower() == "nan":
+        return None
+    cleaned = re.sub(r"[^\d+]", "", raw)
+    if not cleaned:
+        return None
+    if cleaned.startswith("+"):
+        normalized = "+" + re.sub(r"[^\d]", "", cleaned[1:])
+    else:
+        normalized = re.sub(r"[^\d]", "", cleaned)
+    if not normalized:
+        return None
+    return f"tel:{normalized}"
+
+
 @st.cache_data(show_spinner=False)
 def load_data(file_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     master = pd.read_excel(file_path, sheet_name="MASTER")
@@ -217,11 +235,23 @@ def load_data(file_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     else:
         master["Bus Required"] = False
 
-    for mobile_col in ["Mobile"]:
-        if mobile_col in master.columns:
-            master[mobile_col] = master[mobile_col].astype(str).str.replace(".0", "", regex=False)
-
-    id_like_cols = ["PNR Number", "Train Number", "Return PNR", "Return Train Number"]
+    # Excel often loads identifier-like cells as floats (e.g. "12345.0").
+    # Normalize these across common ID/contact/seat/group fields.
+    id_like_cols = [
+        "PNR Number",
+        "Train Number",
+        "Return PNR",
+        "Return Train Number",
+        "Mobile",
+        "Phone",
+        "Phone Number",
+        "Group",
+        "STAY",
+        "Seat",
+        "Return Seat",
+        "Coach",
+        "Return Coach",
+    ]
     for col in id_like_cols:
         if col in master.columns:
             master[col] = master[col].map(_clean_id_like_value)
@@ -584,7 +614,94 @@ def render_admin_page(df: pd.DataFrame) -> None:
         st.info("Select journey type, date, and train number to view passengers.")
 
     st.divider()
-    st.subheader("2. Filter by PNR")
+    st.subheader("2. Search by Name (Stay Group)")
+    admin_name_options5 = sorted(
+        [v for v in df["Name"].dropna().astype(str).str.strip().unique().tolist() if v and v.lower() != "nan"]
+    )
+    selected_name5 = st.selectbox(
+        "Name",
+        options=admin_name_options5,
+        index=None,
+        placeholder="Type to search name",
+        key="admin_name_5",
+    )
+    if not selected_name5:
+        st.info("Select a name to view stay-group passengers.")
+    else:
+        matched5 = df[df["Name"].astype(str).str.strip() == selected_name5].copy()
+        stay_values5 = [v for v in matched5["STAY"].dropna().astype(str).str.strip().unique().tolist() if v]
+        if not stay_values5:
+            st.info("Selected person has no STAY value, so no stay-group records can be shown.")
+        else:
+            output_source5 = df[df["STAY"].astype(str).str.strip().isin(stay_values5)].copy()
+            output_source5["_searched_name_first"] = (
+                output_source5["Name"].astype(str).str.strip() == str(selected_name5).strip()
+            )
+            output_source5 = output_source5.sort_values(by=["STAY", "Group", "Name"], na_position="last")
+            output_source5 = output_source5.sort_values(by="_searched_name_first", ascending=False, kind="stable")
+            output_source5 = output_source5.drop(columns=["_searched_name_first"])
+
+            phone_col5 = None
+            for candidate_col in ["Mobile", "Phone", "Phone Number"]:
+                if candidate_col in output_source5.columns:
+                    phone_col5 = candidate_col
+                    break
+
+            table_cols5 = [
+                "Group",
+                "Name",
+                "NAME ON TICKET-DEPARTURE",
+                "NAME ON TICKET-RETURN",
+                "Gender",
+                "Age",
+                "STAY",
+                "Departure",
+                "Status Departure",
+                "Station Name",
+                "PNR Number",
+                "Train Number",
+                "Coach",
+                "Seat",
+                "Return",
+                "Status Return",
+                "Return Station",
+                "Return PNR",
+                "Return Train Number",
+                "Return Coach",
+                "Return Seat",
+                "BUS TRAVEL",
+            ]
+            if phone_col5:
+                table_cols5.insert(2, phone_col5)
+            table_cols5 = [c for c in table_cols5 if c in output_source5.columns]
+
+            output_df5 = _format_output_dates_and_age(output_source5[table_cols5].copy())
+            if phone_col5 and phone_col5 in output_df5.columns:
+                output_df5[phone_col5] = output_df5[phone_col5].map(
+                    lambda value: _to_phone_href(value) if str(value).strip().upper() != "NA" else None
+                )
+
+            st.caption(f"Stay values found: {', '.join(stay_values5)}")
+            st.caption(f"Passengers found: {len(output_df5)}")
+            column_config5 = {}
+            if phone_col5 and phone_col5 in output_df5.columns:
+                column_config5[phone_col5] = st.column_config.LinkColumn(
+                    phone_col5,
+                    help="Tap to call",
+                    validate=r"^tel:\+?\d+$",
+                    display_text=r"tel:(.*)",
+                )
+
+            st.dataframe(
+                output_df5,
+                use_container_width=True,
+                hide_index=True,
+                height=_table_height(len(output_df5)),
+                column_config=column_config5 if column_config5 else None,
+            )
+
+    st.divider()
+    st.subheader("3. Filter by PNR")
     dep_pnr_options = [
         v for v in df["PNR Number"].dropna().astype(str).str.strip().unique().tolist() if v and v.lower() != "nan"
     ]
@@ -657,7 +774,7 @@ def render_admin_page(df: pd.DataFrame) -> None:
         st.info("Select a PNR to view passengers.")
 
     st.divider()
-    st.subheader("3. Filter by Bus Date")
+    st.subheader("4. Filter by Bus Date")
     if "BUS TRAVEL" not in df.columns:
         st.info("Bus travel column not available in data.")
     else:
@@ -699,7 +816,7 @@ def render_admin_page(df: pd.DataFrame) -> None:
                 )
 
     st.divider()
-    st.subheader("4. Filter by Group")
+    st.subheader("5. Filter by Group")
     group_options4 = sorted(
         [v for v in df["Group"].dropna().astype(str).str.strip().unique().tolist() if v and v.lower() != "nan"]
     )
@@ -753,7 +870,6 @@ def render_admin_page(df: pd.DataFrame) -> None:
         )
     else:
         st.info("Select a group to view passengers.")
-
 
 def main() -> None:
     st.title("Shailiben Diksha Mahotsav Guest Travel Dashboard")
