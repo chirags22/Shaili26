@@ -133,6 +133,59 @@ def _jpeg_filename(*parts: object) -> str:
     return f"{base}.jpeg"
 
 
+def _room_sort_key(value: object) -> tuple[int, int | float, str]:
+    text = str(value).strip()
+    lower = text.lower()
+    shubh_num_match = re.match(r"^shubh\s*0*(\d+)$", lower)
+    if shubh_num_match:
+        return (0, int(shubh_num_match.group(1)), lower)
+    if re.match(r"^shubh\s*allot$", lower):
+        return (0, 10_000, lower)
+    if lower.startswith("shubh"):
+        return (0, 20_000, lower)
+    if text.isdigit():
+        return (1, int(text), text)
+    return (2, float("inf"), lower)
+
+
+def _room_group_label(value: object) -> str:
+    text = str(value).strip()
+    if text == "TRUSTEE OFFICE 1st Floor":
+        return "Named Rooms"
+    normalized = re.sub(r"[^a-z0-9]+", "", text.lower())
+    named_room_markers = [
+        "anupama",
+        "kumarpal",
+        "kumarbhai",
+        "mahakali",
+        "mayna",
+        "shripalmaharaja",
+    ]
+    if any(marker in normalized for marker in named_room_markers):
+        return "Named Rooms"
+    if text.isdigit():
+        num = int(text)
+        if num >= 100:
+            return f"{(num // 100) * 100} Range"
+        return "1-99 Range"
+    alpha_prefix = re.match(r"^[A-Za-z]+", text)
+    if alpha_prefix:
+        normalized_prefix = alpha_prefix.group(0).capitalize()
+        return f"Starting with {normalized_prefix}"
+    return "Other"
+
+
+def _room_group_sort_key(label: str) -> tuple[int, int | float, str]:
+    range_match = re.match(r"^(\d+)\s+Range$", label)
+    if range_match:
+        return (0, int(range_match.group(1)), label)
+    if label == "1-99 Range":
+        return (0, 1, label)
+    if label.startswith("Starting with "):
+        return (1, float("inf"), label.lower())
+    return (2, float("inf"), label.lower())
+
+
 def _coach_type(value: object) -> str | None:
     if pd.isna(value):
         return None
@@ -650,11 +703,13 @@ def render_admin_page(df: pd.DataFrame) -> None:
             table_cols5 = [
                 "Group",
                 "Name",
-                "NAME ON TICKET-DEPARTURE",
-                "NAME ON TICKET-RETURN",
                 "Gender",
                 "Age",
                 "STAY",
+            ]
+            departure_cols5 = [
+                *table_cols5,
+                "NAME ON TICKET-DEPARTURE",
                 "Departure",
                 "Status Departure",
                 "Station Name",
@@ -662,6 +717,10 @@ def render_admin_page(df: pd.DataFrame) -> None:
                 "Train Number",
                 "Coach",
                 "Seat",
+            ]
+            return_cols5 = [
+                *table_cols5,
+                "NAME ON TICKET-RETURN",
                 "Return",
                 "Status Return",
                 "Return Station",
@@ -672,19 +731,26 @@ def render_admin_page(df: pd.DataFrame) -> None:
                 "BUS TRAVEL",
             ]
             if phone_col5:
-                table_cols5.insert(2, phone_col5)
-            table_cols5 = [c for c in table_cols5 if c in output_source5.columns]
+                departure_cols5.insert(2, phone_col5)
+                return_cols5.insert(2, phone_col5)
+            departure_cols5 = [c for c in departure_cols5 if c in output_source5.columns]
+            return_cols5 = [c for c in return_cols5 if c in output_source5.columns]
 
-            output_df5 = _format_output_dates_and_age(output_source5[table_cols5].copy())
-            if phone_col5 and phone_col5 in output_df5.columns:
-                output_df5[phone_col5] = output_df5[phone_col5].map(
+            departure_df5 = _format_output_dates_and_age(output_source5[departure_cols5].copy())
+            return_df5 = _format_output_dates_and_age(output_source5[return_cols5].copy())
+            if phone_col5 and phone_col5 in departure_df5.columns:
+                departure_df5[phone_col5] = departure_df5[phone_col5].map(
+                    lambda value: _to_phone_href(value) if str(value).strip().upper() != "NA" else None
+                )
+            if phone_col5 and phone_col5 in return_df5.columns:
+                return_df5[phone_col5] = return_df5[phone_col5].map(
                     lambda value: _to_phone_href(value) if str(value).strip().upper() != "NA" else None
                 )
 
             st.caption(f"Stay values found: {', '.join(stay_values5)}")
-            st.caption(f"Passengers found: {len(output_df5)}")
+            st.caption(f"Passengers found: {len(departure_df5)}")
             column_config5 = {}
-            if phone_col5 and phone_col5 in output_df5.columns:
+            if phone_col5 and phone_col5 in departure_df5.columns:
                 column_config5[phone_col5] = st.column_config.LinkColumn(
                     phone_col5,
                     help="Tap to call",
@@ -692,11 +758,20 @@ def render_admin_page(df: pd.DataFrame) -> None:
                     display_text=r"tel:(.*)",
                 )
 
+            st.markdown("**Departure Details**")
             st.dataframe(
-                output_df5,
+                departure_df5,
                 use_container_width=True,
                 hide_index=True,
-                height=_table_height(len(output_df5)),
+                height=_table_height(len(departure_df5)),
+                column_config=column_config5 if column_config5 else None,
+            )
+            st.markdown("**Return Details**")
+            st.dataframe(
+                return_df5,
+                use_container_width=True,
+                hide_index=True,
+                height=_table_height(len(return_df5)),
                 column_config=column_config5 if column_config5 else None,
             )
 
@@ -816,7 +891,119 @@ def render_admin_page(df: pd.DataFrame) -> None:
                 )
 
     st.divider()
-    st.subheader("5. Filter by Group")
+    st.subheader("5. Filter by Room Number")
+    if "STAY" not in df.columns:
+        st.info("Room column (STAY) not available in data.")
+    else:
+        room_options = sorted(
+            [
+                v
+                for v in df["STAY"].dropna().astype(str).str.strip().unique().tolist()
+                if v and v.lower() not in {"nan", "cancel"}
+            ],
+            key=_room_sort_key,
+        )
+        room_groups: dict[str, list[str]] = {}
+        for room_value in room_options:
+            group_label = _room_group_label(room_value)
+            room_groups.setdefault(group_label, []).append(room_value)
+
+        room_group_options = sorted(room_groups.keys(), key=_room_group_sort_key)
+        selected_group_key = "admin_room_group_5_selected"
+        selected_room_key = "admin_room_5_selected"
+        if selected_group_key not in st.session_state:
+            st.session_state[selected_group_key] = None
+        if selected_room_key not in st.session_state:
+            st.session_state[selected_room_key] = None
+
+        st.markdown("**Room Category**")
+        per_row_group = 5
+        for row_start in range(0, len(room_group_options), per_row_group):
+            row_groups = room_group_options[row_start: row_start + per_row_group]
+            group_cols = st.columns(len(row_groups))
+            for idx, group_value in enumerate(row_groups):
+                with group_cols[idx]:
+                    button_text = group_value
+                    if st.session_state[selected_group_key] == group_value:
+                        button_text = f"[{group_value}]"
+                    if st.button(
+                        button_text,
+                        key=f"admin_room_group_btn_{row_start + idx}",
+                        use_container_width=True,
+                    ):
+                        st.session_state[selected_group_key] = group_value
+                        st.session_state[selected_room_key] = None
+
+        selected_room_group = st.session_state[selected_group_key]
+        if selected_room_group:
+            st.markdown(f"**Room Options in {selected_room_group}**")
+            room_values = room_groups[selected_room_group]
+            per_row_room = 12
+            for row_start in range(0, len(room_values), per_row_room):
+                row_rooms = room_values[row_start: row_start + per_row_room]
+                room_cols = st.columns(len(row_rooms))
+                for idx, room_value in enumerate(row_rooms):
+                    with room_cols[idx]:
+                        button_text = room_value
+                        if st.session_state[selected_room_key] == room_value:
+                            button_text = f"[{room_value}]"
+                        if st.button(
+                            button_text,
+                            key=f"admin_room_btn_{selected_room_group}_{row_start + idx}",
+                            use_container_width=True,
+                        ):
+                            st.session_state[selected_room_key] = room_value
+            selected_room = st.session_state[selected_room_key]
+            st.caption(f"Selected room: {selected_room}" if selected_room else "No room selected")
+        else:
+            selected_room = None
+            st.info("Select a room category to view room options.")
+
+        if selected_room:
+            room_filtered = df[df["STAY"].astype(str).str.strip() == selected_room].copy()
+            dep_date_col, dep_train_col, dep_status_col, dep_station_col, dep_pnr_col, dep_coach_col, dep_seat_col, _ = (
+                journey_columns("Departure")
+            )
+            ret_date_col, ret_train_col, ret_status_col, ret_station_col, ret_pnr_col, ret_coach_col, ret_seat_col, _ = (
+                journey_columns("Return")
+            )
+
+            render_admin_result_block(
+                room_filtered,
+                dep_date_col,
+                dep_train_col,
+                dep_status_col,
+                dep_station_col,
+                dep_pnr_col,
+                dep_coach_col,
+                dep_seat_col,
+                f"Room {selected_room} Passenger List (Departure)",
+                include_bus_travel=False,
+                show_coach_counts=False,
+                key_prefix="admin_room_dep",
+                download_name_parts=("admin", "room", selected_room, "departure"),
+            )
+
+            render_admin_result_block(
+                room_filtered,
+                ret_date_col,
+                ret_train_col,
+                ret_status_col,
+                ret_station_col,
+                ret_pnr_col,
+                ret_coach_col,
+                ret_seat_col,
+                f"Room {selected_room} Passenger List (Return)",
+                include_bus_travel=True,
+                show_coach_counts=False,
+                key_prefix="admin_room_ret",
+                download_name_parts=("admin", "room", selected_room, "return"),
+            )
+        else:
+            st.info("Select a room number to view passengers.")
+
+    st.divider()
+    st.subheader("6. Filter by Group")
     group_options4 = sorted(
         [v for v in df["Group"].dropna().astype(str).str.strip().unique().tolist() if v and v.lower() != "nan"]
     )
