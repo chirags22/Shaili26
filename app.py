@@ -16,6 +16,62 @@ st.set_page_config(page_title="Boarding Pass Dashboard", layout="wide")
 DATA_FILE_DEFAULT = Path("Boarding_Pass.xlsx")
 
 
+def apply_dark_theme() -> None:
+    st.markdown(
+        """
+        <style>
+        .stApp {
+            background: linear-gradient(180deg, #0b1220 0%, #111827 100%);
+            color: #e5e7eb;
+        }
+        .block-container {
+            max-width: 1080px;
+            padding-top: 1.2rem;
+            padding-bottom: 2rem;
+        }
+        .contact-note {
+            border: 1px solid #2f3b4c;
+            border-radius: 12px;
+            background: #111827;
+            padding: 12px 14px;
+            margin-top: 10px;
+            color: #e5e7eb;
+        }
+        .credits-title {
+            margin-top: 10px;
+            font-size: 1.2rem;
+            font-weight: 700;
+            color: #f8fafc;
+        }
+        .credits-note {
+            margin-top: 2px;
+            color: #cbd5e1;
+            font-size: 0.95rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _invite_sort_key(path: Path) -> tuple[int, str]:
+    match = re.search(r"(\d+)", path.stem)
+    if match:
+        return (int(match.group(1)), path.name.lower())
+    return (10_000, path.name.lower())
+
+
+def render_invite_photos_section() -> None:
+    invite_files = sorted(Path(".").glob("Invite*"), key=_invite_sort_key)
+    invite_files = [p for p in invite_files if p.is_file()]
+    if not invite_files:
+        st.info("No Invite photos found in the current folder.")
+        return
+
+    for image_path in invite_files:
+        st.image(str(image_path), use_container_width=True)
+
+
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     renamed = {
@@ -50,6 +106,8 @@ def _clean_id_like_value(value: object) -> object:
 
 def _table_image_bytes(df: pd.DataFrame, image_format: str = "png") -> bytes:
     render_df = df.fillna("").astype(str)
+    if render_df.empty or render_df.shape[1] == 0:
+        render_df = pd.DataFrame([{"Message": "No data available"}])
     n_rows, n_cols = render_df.shape
     col_char_sizes = [max([len(str(c))] + render_df.iloc[:, i].map(len).tolist()) for i, c in enumerate(render_df.columns)]
     total_chars = max(1, sum(col_char_sizes))
@@ -315,32 +373,34 @@ def load_data(file_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def render_guest_page(df: pd.DataFrame) -> None:
-    st.caption("Enter your Name")
-    f1 = st.columns(1)[0]
+    st.markdown("### Find Your Travel Details")
+    st.caption("Select your name once. Your full stay-group details will appear below.")
+
     name_options = sorted(
         [v for v in df["Name"].dropna().astype(str).str.strip().unique().tolist() if v and v.lower() != "nan"]
     )
 
-    with f1:
-        name_query = st.selectbox(
-            "Name",
-            options=name_options,
-            index=None,
-            placeholder="Type to search name",
-        )
-    matched = df.copy()
+    name_query = st.selectbox(
+        "Search your name",
+        options=name_options,
+        index=None,
+        placeholder="Type or select your name",
+    )
     if not name_query:
         st.info("Select a name to search.")
-        st.stop()
+        render_invite_photos_section()
+        return
 
+    matched = df.copy()
     if name_query:
         matched = matched[matched["Name"].astype(str).str.strip() == name_query]
     match_count = len(matched)
-    st.caption(f"Matched People: {match_count}")
+    st.success(f"Found {match_count} matching record(s) for {name_query}.")
 
     if match_count == 0:
         st.warning("No match found for the selected filters.")
-        st.stop()
+        render_invite_photos_section()
+        return
     base_token = name_query if name_query else str(matched.iloc[0].get("Name", "guest"))
     base_filename = f"{_safe_filename_part(str(base_token))}_travel_data"
     table_cols = [
@@ -372,8 +432,9 @@ def render_guest_page(df: pd.DataFrame) -> None:
     stay_values = [v for v in matched["STAY"].dropna().astype(str).str.strip().unique().tolist() if v]
     if not stay_values:
         st.info("Matched person has no STAY value, so no stay-group records can be shown.")
-        st.stop()
-    st.caption(f"Stay values found: {', '.join(stay_values)}")
+        render_invite_photos_section()
+        return
+    st.caption(f"Stay Group: {', '.join(stay_values)}")
     output_source = df[df["STAY"].astype(str).str.strip().isin(stay_values)].copy()
     output_source["_searched_name_first"] = (
         output_source["Name"].astype(str).str.strip() == str(name_query).strip()
@@ -420,24 +481,18 @@ def render_guest_page(df: pd.DataFrame) -> None:
     departure_df = output_df[departure_cols].copy()
     return_df = output_df[return_cols].copy()
 
-    st.subheader("Travel Data")
-
-    dep_header_col, dep_btn_col, _ = st.columns([2, 1, 6])
-    with dep_header_col:
-        st.markdown(
-            "<div style='display:inline-block;background:#ffec99;color:#1f2937;border:1px solid #d4a017;"
-            "padding:6px 10px;border-radius:6px;font-size:1.1rem;font-weight:700;'>"
-            "Departure Table (Towards Gujarat)</div>",
-            unsafe_allow_html=True,
-        )
-    with dep_btn_col:
-        dep_image_bytes = _table_image_bytes(departure_df, image_format="jpeg")
-        st.download_button(
-            "Download Departure (JPEG)",
-            data=dep_image_bytes,
-            file_name=_jpeg_filename(base_filename, "departure", "towards_gujarat"),
-            mime="image/jpeg",
-        )
+    st.markdown("### Travel Details")
+    st.markdown(
+        "<div class='contact-note'><strong>Departure (Towards Gujarat)</strong></div>",
+        unsafe_allow_html=True,
+    )
+    dep_image_bytes = _table_image_bytes(departure_df, image_format="jpeg")
+    st.download_button(
+        "Download Departure (JPEG)",
+        data=dep_image_bytes,
+        file_name=_jpeg_filename(base_filename, "departure", "towards_gujarat"),
+        mime="image/jpeg",
+    )
     st.dataframe(
         departure_df,
         use_container_width=True,
@@ -445,28 +500,24 @@ def render_guest_page(df: pd.DataFrame) -> None:
         height=_table_height(len(departure_df)),
     )
 
-    ret_header_col, ret_btn_col, _ = st.columns([2, 1, 6])
-    with ret_header_col:
-        st.markdown(
-            "<div style='display:inline-block;background:#ffec99;color:#1f2937;border:1px solid #d4a017;"
-            "padding:6px 10px;border-radius:6px;font-size:1.1rem;font-weight:700;'>"
-            "Return Table (Towards Mumbai)</div>",
-            unsafe_allow_html=True,
-        )
-    with ret_btn_col:
-        ret_image_bytes = _table_image_bytes(return_df, image_format="jpeg")
-        st.download_button(
-            "Download Return (JPEG)",
-            data=ret_image_bytes,
-            file_name=_jpeg_filename(base_filename, "return", "towards_mumbai"),
-            mime="image/jpeg",
-        )
+    st.markdown(
+        "<div class='contact-note'><strong>Return (Towards Mumbai)</strong></div>",
+        unsafe_allow_html=True,
+    )
+    ret_image_bytes = _table_image_bytes(return_df, image_format="jpeg")
+    st.download_button(
+        "Download Return (JPEG)",
+        data=ret_image_bytes,
+        file_name=_jpeg_filename(base_filename, "return", "towards_mumbai"),
+        mime="image/jpeg",
+    )
     st.dataframe(
         return_df,
         use_container_width=True,
         hide_index=True,
         height=_table_height(len(return_df)),
     )
+    render_invite_photos_section()
 
 
 def render_admin_page(df: pd.DataFrame) -> None:
@@ -1058,6 +1109,7 @@ def render_admin_page(df: pd.DataFrame) -> None:
         st.info("Select a group to view passengers.")
 
 def main() -> None:
+    apply_dark_theme()
     st.title("Shailiben Diksha Mahotsav Guest Travel Dashboard")
     st.markdown(
         """પ્રણામ,
@@ -1092,10 +1144,13 @@ Chirag: <a href="tel:9604980800">9604980800</a>"""
         return
 
     admin_passcode = st.text_input("Admin Access Code", type="password")
+    if not admin_passcode:
+        st.info("Enter admin access code to open admin tools.")
+        return
     expected_passcode = os.environ.get("ADMIN_DASHBOARD_PASSCODE", "Shaili*26")
     if admin_passcode != expected_passcode:
-        st.warning("Admin access required.")
-        st.stop()
+        st.error("Invalid admin access code.")
+        return
     render_admin_page(df)
 
 
