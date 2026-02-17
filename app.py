@@ -387,7 +387,6 @@ def render_guest_page(df: pd.DataFrame) -> None:
         placeholder="Type or select your name",
     )
     if not name_query:
-        st.info("Select a name to search.")
         render_invite_photos_section()
         return
 
